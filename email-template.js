@@ -51,7 +51,7 @@ function getEmailTemplate(user) {
         <td style="padding:40px 40px 30px;">
 
             <h2 style="margin:0;font-size:27px;color:#111827;font-weight:700;">
-                Hello ${customer_name} 👋
+                Hello ${name}👋
             </h2>
 
             <p style="font-size:16px;line-height:28px;color:#6b7280;margin-top:20px;">
