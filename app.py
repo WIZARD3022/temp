@@ -1,1328 +1,787 @@
+#!/usr/bin/env python3
+"""
+Raspberry Pi Zero W camera + dual relay + buzzer dashboard.
 
-import io
-import time
-import signal
+Hardware:
+  OV5647 camera: CSI connector
+  Capture button: BCM GPIO17 to GND (internal pull-up)
+  Relay 1 IN: BCM GPIO23
+  Relay 2 IN: BCM GPIO24
+  Passive buzzer: BCM GPIO22 through a suitable transistor driver
+
+Install:
+  sudo apt update
+  sudo apt install -y python3-picamera2 python3-flask python3-gpiozero python3-lgpio python3-opencv
+Run with system Python:
+  python3 /home/uv/temp/app.py
+"""
+
 import atexit
-import threading
 import logging
-
-from pathlib import Path
+import queue
+import signal
+import threading
+import time
 from datetime import datetime
+from pathlib import Path
 
 import cv2
-
 from flask import (
-    Flask,
-    Response,
-    jsonify,
-    request,
-    render_template_string,
-    send_from_directory,
-    abort
+    Flask, Response, abort, jsonify, render_template_string,
+    send_from_directory
 )
-
+from gpiozero import Button, OutputDevice, PWMOutputDevice
 from picamera2 import Picamera2
-from gpiozero import Button, OutputDevice
 
 
-# =========================================================
-# 1. APPLICATION CONFIGURATION
-# =========================================================
+# ============================================================
+# CONFIGURATION — EDIT THESE VALUES FOR YOUR HARDWARE
+# ============================================================
 
 BASE_DIR = Path(__file__).resolve().parent
 PHOTO_DIR = BASE_DIR / "photos"
-
 PHOTO_DIR.mkdir(parents=True, exist_ok=True)
 
 HOST = "0.0.0.0"
 PORT = 5000
 
-# GPIO BCM pin numbers
 BUTTON_PIN = 17
 RELAY_1_PIN = 23
 RELAY_2_PIN = 24
+BUZZER_PIN = 22
 
-# Most common relay boards are active LOW.
-# True = active HIGH, False = active LOW.
+# Most 5V relay modules are active LOW. Change to True only if
+# your relay board is confirmed active-HIGH.
 RELAY_ACTIVE_HIGH = False
 
-# Camera resolutions
-PHOTO_SIZE = (2592, 1944)  # 5MP
+# Each relay has its own maximum continuous ON time.
+# These are example defaults: Relay 1 = 60 seconds, Relay 2 = 120 seconds.
+# Change them to the required number of seconds.
+RELAY_1_MAX_ON_SECONDS = 60
+RELAY_2_MAX_ON_SECONDS = 120
+
+# Use a passive buzzer for different pitches/tones.
+# This code uses PWMOutputDevice and is intended for a passive buzzer.
+# If using a magnetic buzzer or one that draws significant current,
+# drive it through a transistor; do not draw its current directly from GPIO.
+BUZZER_ENABLED = True
+BUZZER_VOLUME = 0.35  # 0.0 to 1.0
+
+PHOTO_SIZE = (2592, 1944)  # OV5647 5MP still image
 VIDEO_SIZE = (640, 480)
+VIDEO_FPS = 10
+VIDEO_JPEG_QUALITY = 70
+STREAM_INTERVAL = 0.10
 
-# Stream settings
-STREAM_INTERVAL = 0.15
-JPEG_QUALITY = 70
-
-app = Flask(__name__)
+# ============================================================
+# LOGGING / APP / LOCKS
+# ============================================================
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
+log = logging.getLogger("PiControl")
 
-logger = logging.getLogger("PiCameraSystem")
+app = Flask(__name__)
+camera_lock = threading.RLock()
+relay_lock = threading.RLock()
+shutdown_event = threading.Event()
 
-# Prevent simultaneous camera operations
-camera_lock = threading.Lock()
-
-# Prevent simultaneous relay operations
-relay_lock = threading.Lock()
-
-# Shutdown protection
-shutdown_lock = threading.Lock()
-is_shutting_down = False
+# Relay state is tracked separately from the physical output object.
+relay_deadlines = {1: None, 2: None}
+relay_started_at = {1: None, 2: None}
+relay_limits = {
+    1: max(1, int(RELAY_1_MAX_ON_SECONDS)),
+    2: max(1, int(RELAY_2_MAX_ON_SECONDS)),
+}
 
 
-# =========================================================
-# 2. RELAY INITIALIZATION
-# =========================================================
+# ============================================================
+# BUZZER: DISTINCT NON-BLOCKING SOUND PATTERNS
+# ============================================================
 
-logger.info("Initializing relay modules...")
+# Pattern is a list of (frequency_hz, duration_seconds).
+# frequency 0 means silence. Patterns run in a worker thread so
+# Flask requests and camera capture are not blocked.
+sound_queue = queue.Queue(maxsize=20)
 
-relays = [
-    OutputDevice(
+SOUNDS = {
+    "startup": [
+        (660, 0.10), (0, 0.04), (880, 0.12), (0, 0.04), (1100, 0.18)
+    ],
+    "photo_ok": [
+        (1200, 0.07), (0, 0.04), (1600, 0.10)
+    ],
+    "photo_error": [
+        (330, 0.22), (0, 0.08), (260, 0.30)
+    ],
+    "relay_on": [
+        (900, 0.08), (0, 0.04), (1200, 0.08)
+    ],
+    "relay_off": [
+        (700, 0.12)
+    ],
+    "auto_off": [
+        (1500, 0.12), (0, 0.08),
+        (1500, 0.12), (0, 0.08),
+        (1000, 0.30)
+    ],
+    "button": [
+        (1000, 0.05)
+    ],
+    "error": [
+        (300, 0.15), (0, 0.05), (300, 0.15)
+    ],
+}
+
+buzzer = None
+if BUZZER_ENABLED:
+    try:
+        buzzer = PWMOutputDevice(
+            BUZZER_PIN,
+            active_high=True,
+            initial_value=0,
+            frequency=1000
+        )
+        log.info("Buzzer initialized on BCM GPIO%d", BUZZER_PIN)
+    except Exception:
+        log.exception("Could not initialize buzzer; continuing without sound")
+        buzzer = None
+
+
+def play_sound(name):
+    """Queue a sound event; never block the caller."""
+    if buzzer is None or name not in SOUNDS or shutdown_event.is_set():
+        return
+    try:
+        sound_queue.put_nowait(name)
+    except queue.Full:
+        log.warning("Buzzer queue full; skipped sound %s", name)
+
+
+def buzzer_worker():
+    while not shutdown_event.is_set():
+        try:
+            name = sound_queue.get(timeout=0.25)
+        except queue.Empty:
+            continue
+
+        try:
+            for frequency, duration in SOUNDS.get(name, []):
+                if shutdown_event.is_set():
+                    break
+                if frequency <= 0:
+                    buzzer.off()
+                else:
+                    buzzer.frequency = frequency
+                    buzzer.value = BUZZER_VOLUME
+                time.sleep(duration)
+            if buzzer:
+                buzzer.off()
+        except Exception:
+            log.exception("Buzzer playback error")
+            try:
+                buzzer.off()
+            except Exception:
+                pass
+        finally:
+            sound_queue.task_done()
+
+
+if buzzer is not None:
+    threading.Thread(target=buzzer_worker, name="buzzer-worker", daemon=True).start()
+
+
+# ============================================================
+# RELAYS
+# ============================================================
+
+log.info("Initializing relays")
+
+relays = {
+    1: OutputDevice(
         RELAY_1_PIN,
         active_high=RELAY_ACTIVE_HIGH,
         initial_value=False
     ),
-
-    OutputDevice(
+    2: OutputDevice(
         RELAY_2_PIN,
         active_high=RELAY_ACTIVE_HIGH,
         initial_value=False
-    )
-]
+    ),
+}
 
 
-def get_relay_status():
+def _relay_status_locked(channel):
+    is_on = bool(relays[channel].is_active)
+    deadline = relay_deadlines[channel]
+    remaining = max(0, int(deadline - time.monotonic())) if is_on and deadline else 0
+    return {
+        "on": is_on,
+        "remaining_seconds": remaining,
+        "max_on_seconds": relay_limits[channel],
+        "gpio": RELAY_1_PIN if channel == 1 else RELAY_2_PIN,
+    }
 
+
+def get_all_relay_status():
     with relay_lock:
-
         return {
-            "relay1": relays[0].is_active,
-            "relay2": relays[1].is_active
+            "relay1": _relay_status_locked(1),
+            "relay2": _relay_status_locked(2),
         }
 
 
-def set_relay(channel, state):
-
+def set_relay(channel, turn_on, reason="manual"):
     if channel not in (1, 2):
-        raise ValueError("Invalid relay channel")
-
-    if not isinstance(state, bool):
-        raise ValueError("State must be boolean")
-
-    if is_shutting_down:
+        raise ValueError("Relay channel must be 1 or 2")
+    if not isinstance(turn_on, bool):
+        raise ValueError("Relay state must be true or false")
+    if shutdown_event.is_set():
         raise RuntimeError("Application is shutting down")
 
     with relay_lock:
+        was_on = bool(relays[channel].is_active)
 
-        relay = relays[channel - 1]
-
-        if state:
-            relay.on()
+        if turn_on:
+            if not was_on:
+                relays[channel].on()
+                relay_started_at[channel] = time.monotonic()
+                relay_deadlines[channel] = (
+                    relay_started_at[channel] + relay_limits[channel]
+                )
+                log.info("Relay %d turned ON (%s), auto-off in %ds",
+                         channel, reason, relay_limits[channel])
+                play_sound("relay_on")
+            else:
+                # An explicit ON command while already ON restarts its timer.
+                relay_started_at[channel] = time.monotonic()
+                relay_deadlines[channel] = (
+                    relay_started_at[channel] + relay_limits[channel]
+                )
+                log.info("Relay %d ON timer reset (%s)", channel, reason)
         else:
-            relay.off()
+            if was_on:
+                relays[channel].off()
+                log.info("Relay %d turned OFF (%s)", channel, reason)
+                if reason == "auto_timeout":
+                    play_sound("auto_off")
+                else:
+                    play_sound("relay_off")
+            relay_started_at[channel] = None
+            relay_deadlines[channel] = None
 
-        return relay.is_active
+        return _relay_status_locked(channel)
 
 
-# =========================================================
-# 3. CAMERA INITIALIZATION
-# =========================================================
+def relay_timeout_worker():
+    """Independently time out each relay using its own deadline."""
+    while not shutdown_event.wait(0.2):
+        expired = []
+        now = time.monotonic()
 
-logger.info("Initializing Raspberry Pi camera...")
+        with relay_lock:
+            for channel in (1, 2):
+                deadline = relay_deadlines[channel]
+                if relays[channel].is_active and deadline is not None and now >= deadline:
+                    expired.append(channel)
 
+        for channel in expired:
+            try:
+                set_relay(channel, False, reason="auto_timeout")
+            except Exception:
+                log.exception("Failed to auto-switch OFF relay %d", channel)
+
+
+threading.Thread(
+    target=relay_timeout_worker,
+    name="relay-timeout-worker",
+    daemon=True
+).start()
+
+
+# ============================================================
+# CAMERA
+# ============================================================
+
+log.info("Initializing Raspberry Pi camera")
 camera = Picamera2()
 
-# Low-resolution stream must use YUV420.
 video_config = camera.create_video_configuration(
-
-    main={
-        "size": (1280, 960),
-        "format": "RGB888"
-    },
-
-    lores={
-        "size": VIDEO_SIZE,
-        "format": "YUV420"
-    },
-
+    main={"size": (1280, 960), "format": "RGB888"},
+    lores={"size": VIDEO_SIZE, "format": "YUV420"},
     buffer_count=4,
-
-    controls={
-        "FrameRate": 10
-    }
+    controls={"FrameRate": VIDEO_FPS},
 )
 
-# Separate high-resolution still configuration.
-# Picamera2 will encode photographs as JPEG.
 still_config = camera.create_still_configuration(
-
-    main={
-        "size": PHOTO_SIZE,
-        "format": "RGB888"
-    },
-
-    buffer_count=1
+    main={"size": PHOTO_SIZE, "format": "RGB888"},
+    buffer_count=1,
 )
 
 camera.configure(video_config)
-
 camera.start()
-
 time.sleep(2)
+log.info("Camera initialized")
 
-logger.info("Camera initialized successfully!")
-
-
-# =========================================================
-# 4. IMAGE CAPTURE FUNCTION
-# =========================================================
+# ============================================================
+# PHOTO CAPTURE
+# ============================================================
 
 def capture_photo(source="web"):
+    if shutdown_event.is_set():
+        return {"success": False, "error": "Application is shutting down"}
 
-    if is_shutting_down:
-        return {
-            "success": False,
-            "error": "Application is shutting down"
-        }
-
-    timestamp = datetime.now().strftime(
-        "%Y%m%d_%H%M%S_%f"
-    )
-
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     filename = f"IMG_{timestamp}.jpg"
-
     filepath = PHOTO_DIR / filename
 
     try:
-
-        logger.info("Capturing photograph from %s", source)
+        PHOTO_DIR.mkdir(parents=True, exist_ok=True)
+        log.info("Photo capture requested by %s", source)
 
         with camera_lock:
-
-            # Switch to full 5MP still mode.
-            # Picamera2 restores the previous video mode afterwards.
             camera.switch_mode_and_capture_file(
                 still_config,
                 str(filepath),
-                name="main"
+                name="main",
             )
 
-        if not filepath.exists() or filepath.stat().st_size == 0:
-            raise RuntimeError("Image file was not created")
+        if not filepath.is_file() or filepath.stat().st_size < 1000:
+            raise RuntimeError("JPEG was not created or is unexpectedly small")
 
-        logger.info("Photograph saved: %s", filepath)
-
+        log.info("Photo saved: %s (%d bytes)", filepath, filepath.stat().st_size)
+        play_sound("photo_ok")
         return {
             "success": True,
             "filename": filename,
             "url": f"/images/{filename}",
             "size": filepath.stat().st_size,
-            "timestamp": timestamp
+            "timestamp": timestamp,
         }
 
-    except Exception as error:
-
-        logger.exception("Photograph capture failed")
-
+    except Exception as exc:
+        log.exception("Photo capture failed")
         try:
-            if filepath.exists():
-                filepath.unlink()
-        except OSError:
+            filepath.unlink(missing_ok=True)
+        except Exception:
             pass
-
-        return {
-            "success": False,
-            "error": str(error)
-        }
-
-
-# =========================================================
-# 5. PHYSICAL BUTTON
-# =========================================================
-
-logger.info("Initializing physical capture button...")
-
-capture_button = Button(
-    BUTTON_PIN,
-    pull_up=True,
-    bounce_time=0.4
-)
+        play_sound("photo_error")
+        return {"success": False, "error": str(exc)}
 
 
 def physical_button_pressed():
-
-    logger.info("Physical button pressed")
-
+    if shutdown_event.is_set():
+        return
+    log.info("Physical capture button pressed")
+    play_sound("button")
     result = capture_photo(source="physical_button")
-
-    if result["success"]:
-
-        logger.info(
-            "Physical capture successful: %s",
-            result["filename"]
-        )
-
-    else:
-
-        logger.error(
-            "Physical capture failed: %s",
-            result["error"]
-        )
+    if not result["success"]:
+        log.error("Physical photo capture failed: %s", result["error"])
 
 
+capture_button = Button(BUTTON_PIN, pull_up=True, bounce_time=0.4)
 capture_button.when_pressed = physical_button_pressed
 
 
-# =========================================================
-# 6. LIVE VIDEO STREAM
-# =========================================================
+# ============================================================
+# LIVE VIDEO
+# ============================================================
 
 def generate_video():
-
-    while not is_shutting_down:
-
+    while not shutdown_event.is_set():
         try:
-
-            # Capture YUV420 frame
             with camera_lock:
-
                 frame = camera.capture_array("lores")
 
-            # Convert YUV420 (I420) to BGR.
-            # OpenCV JPEG encoder expects BGR.
-            bgr_frame = cv2.cvtColor(
-                frame,
-                cv2.COLOR_YUV2BGR_I420
+            # Picamera2 lores YUV420 is planar I420.
+            bgr = cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_I420)
+            ok, encoded = cv2.imencode(
+                ".jpg", bgr,
+                [cv2.IMWRITE_JPEG_QUALITY, VIDEO_JPEG_QUALITY]
             )
-
-            # Encode JPEG
-            success, encoded = cv2.imencode(
-                ".jpg",
-                bgr_frame,
-                [
-                    cv2.IMWRITE_JPEG_QUALITY,
-                    JPEG_QUALITY
-                ]
-            )
-
-            if not success:
+            if not ok:
                 continue
-
-            jpeg_data = encoded.tobytes()
 
             yield (
                 b"--frame\r\n"
                 b"Content-Type: image/jpeg\r\n"
                 b"Cache-Control: no-cache\r\n\r\n"
-                + jpeg_data +
-                b"\r\n"
+                + encoded.tobytes() + b"\r\n"
             )
-
             time.sleep(STREAM_INTERVAL)
 
         except GeneratorExit:
             break
-
         except Exception:
-
-            logger.exception("Live stream error")
-
+            log.exception("Video stream error")
             time.sleep(1)
 
 
-# =========================================================
-# 7. WEBPAGE
-# =========================================================
+# ============================================================
+# WEB DASHBOARD
+# ============================================================
 
 HTML_PAGE = r"""
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
-
 <head>
-
-<meta charset="UTF-8">
-
-<meta name="viewport"
-content="width=device-width, initial-scale=1">
-
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Raspberry Pi Control Center</title>
-
 <style>
-
-* {
-    box-sizing: border-box;
-}
-
-body {
-    margin: 0;
-    padding: 18px;
-    background: #101827;
-    color: #f8fafc;
-    font-family: Arial, sans-serif;
-}
-
-header, main {
-    max-width: 1100px;
-    margin: auto;
-}
-
-header {
-    margin-bottom: 22px;
-}
-
-h1 {
-    font-size: 25px;
-}
-
-h2 {
-    font-size: 20px;
-}
-
-.muted {
-    color: #94a3b8;
-}
-
-.card {
-    background: #1e293b;
-    padding: 18px;
-    margin-bottom: 20px;
-    border-radius: 14px;
-    border: 1px solid #334155;
-}
-
-.top-status {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 10px;
-}
-
-.pill {
-    background: #0f172a;
-    padding: 10px 14px;
-    border-radius: 8px;
-    font-size: 13px;
-}
-
-.online {
-    color: #4ade80;
-}
-
-.offline {
-    color: #f87171;
-}
-
-.video {
-    width: 100%;
-    max-width: 800px;
-    display: block;
-    margin: 15px auto;
-    background: #000;
-    border-radius: 10px;
-}
-
-.primary {
-    background: #2563eb;
-    color: white;
-}
-
-button {
-    padding: 13px 18px;
-    border: none;
-    border-radius: 8px;
-    cursor: pointer;
-    font-size: 15px;
-}
-
-button:disabled {
-    opacity: 0.5;
-    cursor: wait;
-}
-
-.capture {
-    width: 100%;
-    margin-top: 12px;
-}
-
-.relay-grid {
-    display: grid;
-    grid-template-columns: repeat(
-        auto-fit,
-        minmax(220px, 1fr)
-    );
-    gap: 15px;
-}
-
-.relay {
-    background: #0f172a;
-    border: 1px solid #334155;
-    border-radius: 12px;
-    padding: 20px;
-}
-
-.relay-status {
-    font-size: 17px;
-    font-weight: bold;
-    margin: 15px 0;
-}
-
-.on {
-    color: #4ade80;
-}
-
-.off {
-    color: #f87171;
-}
-
-.toggle {
-    width: 100%;
-    background: #475569;
-    color: white;
-}
-
-.toggle.enabled {
-    background: #16a34a;
-}
-
-.gallery {
-    display: grid;
-    grid-template-columns: repeat(
-        auto-fill,
-        minmax(150px, 1fr)
-    );
-    gap: 13px;
-}
-
-.photo {
-    background: #0f172a;
-    border-radius: 10px;
-    overflow: hidden;
-    border: 1px solid #334155;
-}
-
-.photo img {
-    display: block;
-    width: 100%;
-    aspect-ratio: 1 / 1;
-    object-fit: cover;
-}
-
-.photo-info {
-    padding: 10px;
-}
-
-.photo-name {
-    font-size: 11px;
-    color: #cbd5e1;
-    overflow-wrap: anywhere;
-}
-
-.download {
-    display: block;
-    color: #93c5fd;
-    font-size: 13px;
-    margin-top: 8px;
-}
-
-.message {
-    color: #4ade80;
-    overflow-wrap: anywhere;
-}
-
-.error {
-    color: #f87171;
-}
-
-.refresh {
-    width: 100%;
-    background: #334155;
-    color: white;
-    margin-bottom: 15px;
-}
-
-@media(max-width: 500px) {
-
-    body {
-        padding: 10px;
-    }
-
-    .card {
-        padding: 13px;
-    }
-
-    h1 {
-        font-size: 21px;
-    }
-
-}
-
+*{box-sizing:border-box}
+body{margin:0;padding:16px;background:#101827;color:#f8fafc;font-family:Arial,sans-serif}
+header,main{max-width:1100px;margin:auto}
+h1{font-size:24px}h2{font-size:19px}
+.muted{color:#94a3b8}
+.card{background:#1e293b;padding:17px;margin:0 0 18px;border-radius:14px;border:1px solid #334155}
+.pills{display:flex;gap:9px;flex-wrap:wrap}
+.pill{background:#0f172a;padding:9px 12px;border-radius:8px;font-size:13px}
+.good{color:#4ade80}.bad{color:#f87171}
+.video{width:100%;max-width:800px;display:block;margin:14px auto;background:#000;border-radius:10px}
+button{padding:12px 16px;border:0;border-radius:8px;cursor:pointer;font-size:14px;color:white}
+button:disabled{opacity:.55;cursor:wait}
+.primary{background:#2563eb}.capture{width:100%}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:13px}
+.relay{background:#0f172a;border:1px solid #334155;border-radius:11px;padding:16px}
+.state{font-weight:bold;font-size:17px;margin:12px 0}
+.toggle{width:100%;background:#475569}.toggle.on{background:#15803d}
+.timer{color:#cbd5e1;font-size:13px;min-height:18px}
+.gallery{display:grid;grid-template-columns:repeat(auto-fill,minmax(145px,1fr));gap:12px}
+.photo{background:#0f172a;border-radius:9px;overflow:hidden}
+.photo img{width:100%;aspect-ratio:1;object-fit:cover;display:block}
+.photo-info{padding:9px;font-size:11px;overflow-wrap:anywhere}
+a{color:#93c5fd}.download{display:block;margin-top:7px}
+.message{overflow-wrap:anywhere;color:#4ade80}.error{color:#f87171}
+.full{width:100%;background:#334155;margin-bottom:12px}
+@media(max-width:500px){body{padding:9px}.card{padding:13px}h1{font-size:21px}}
 </style>
-
 </head>
-
-
 <body>
-
 <header>
-
-    <h1>📷 Raspberry Pi Control Center</h1>
-
-    <p class="muted">
-        Camera, image gallery and dual relay controller
-    </p>
-
-    <div class="top-status">
-
-        <div class="pill">
-            Camera:
-            <strong id="cameraStatus" class="offline">
-                Checking...
-            </strong>
-        </div>
-
-        <div class="pill">
-            Total Photos:
-            <strong id="photoCount">0</strong>
-        </div>
-
-    </div>
-
+<h1>📷 Raspberry Pi Control Center</h1>
+<p class="muted">OV5647 camera · Photo gallery · Dual relay · Buzzer</p>
+<div class="pills">
+<div class="pill">Camera: <b id="cameraStatus" class="bad">CHECKING</b></div>
+<div class="pill">Photos: <b id="photoCount">0</b></div>
+<div class="pill">Buzzer: <b id="buzzerStatus">CHECKING</b></div>
+</div>
 </header>
-
-
 <main>
-
-
-<!-- LIVE CAMERA -->
-
 <section class="card">
-
-    <h2>📹 Live Camera</h2>
-
-    <p class="muted">
-        OV5647 camera live preview
-    </p>
-
-    <img
-        id="videoFeed"
-        class="video"
-        src="/video_feed"
-        alt="Camera stream"
-    >
-
-    <button
-        class="primary capture"
-        id="captureButton"
-        onclick="capturePhoto()"
-    >
-        📸 Capture Photograph
-    </button>
-
-    <p id="captureMessage" class="message"></p>
-
+<h2>📹 Live camera</h2>
+<img class="video" src="/video_feed" alt="Live camera feed">
+<button class="primary capture" id="captureButton" onclick="capturePhoto()">📸 Capture 5MP photograph</button>
+<p id="captureMessage" class="message"></p>
 </section>
 
-
-<!-- DUAL RELAY -->
-
 <section class="card">
-
-    <h2>⚡ Dual Relay Controller</h2>
-
-    <p class="muted">
-        Independent relay control
-    </p>
-
-    <div class="relay-grid">
-
-        <div class="relay">
-
-            <h3>Relay 1</h3>
-
-            <p class="muted">GPIO 23</p>
-
-            <p class="relay-status off" id="status1">
-                ● OFF
-            </p>
-
-            <button
-                class="toggle"
-                id="relayBtn1"
-                onclick="toggleRelay(1)"
-            >
-                Turn ON
-            </button>
-
-        </div>
-
-
-        <div class="relay">
-
-            <h3>Relay 2</h3>
-
-            <p class="muted">GPIO 24</p>
-
-            <p class="relay-status off" id="status2">
-                ● OFF
-            </p>
-
-            <button
-                class="toggle"
-                id="relayBtn2"
-                onclick="toggleRelay(2)"
-            >
-                Turn ON
-            </button>
-
-        </div>
-
-    </div>
-
+<h2>⚡ Dual relay controller</h2>
+<p class="muted">Each relay has an independent automatic OFF timer.</p>
+<div class="grid">
+<div class="relay">
+<h3>Relay 1 · GPIO 23</h3>
+<div id="status1" class="state bad">● OFF</div>
+<div id="timer1" class="timer">Auto OFF limit: —</div>
+<button id="relayBtn1" class="toggle" onclick="toggleRelay(1)">Turn ON</button>
+</div>
+<div class="relay">
+<h3>Relay 2 · GPIO 24</h3>
+<div id="status2" class="state bad">● OFF</div>
+<div id="timer2" class="timer">Auto OFF limit: —</div>
+<button id="relayBtn2" class="toggle" onclick="toggleRelay(2)">Turn ON</button>
+</div>
+</div>
+<p class="muted">The auto-OFF countdown starts when a relay turns ON. Turning it ON again resets that relay's timer.</p>
 </section>
 
-
-<!-- IMAGE GALLERY -->
-
 <section class="card">
-
-    <h2>🖼 Captured Images</h2>
-
-    <p class="muted">
-        Photographs stored on Raspberry Pi
-    </p>
-
-    <button
-        class="refresh"
-        onclick="loadImages()"
-    >
-        🔄 Refresh Gallery
-    </button>
-
-    <div class="gallery" id="gallery">
-        Loading photographs...
-    </div>
-
+<h2>🖼 Captured photographs</h2>
+<button class="full" onclick="loadImages()">↻ Refresh gallery</button>
+<div class="gallery" id="gallery">Loading photographs…</div>
 </section>
-
-
 </main>
 
-
 <script>
+let relayStates={1:false,2:false};
+let relayBusy={1:false,2:false};
 
-
-// =====================================================
-// APPLICATION STATE
-// =====================================================
-
-let relayStates = {
-    1: false,
-    2: false
-};
-
-let relayBusy = {
-    1: false,
-    2: false
-};
-
-
-// =====================================================
-// CAPTURE PHOTOGRAPH
-// =====================================================
-
-async function capturePhoto() {
-
-    const button =
-        document.getElementById("captureButton");
-
-    const message =
-        document.getElementById("captureMessage");
-
-    button.disabled = true;
-
-    message.className = "message";
-    message.textContent = "Capturing 5MP photograph...";
-
-    try {
-
-        const response = await fetch(
-            "/api/capture",
-            {
-                method: "POST"
-            }
-        );
-
-        const result = await response.json();
-
-        if (!response.ok || !result.success) {
-
-            throw new Error(
-                result.error || "Capture failed"
-            );
-
-        }
-
-        message.textContent =
-            "Saved: " + result.filename;
-
-        loadImages();
-
-    } catch (error) {
-
-        message.className = "message error";
-
-        message.textContent =
-            "Error: " + error.message;
-
-    } finally {
-
-        button.disabled = false;
-
-    }
-
+async function capturePhoto(){
+ const btn=document.getElementById('captureButton');
+ const msg=document.getElementById('captureMessage');
+ btn.disabled=true; msg.className='message'; msg.textContent='Capturing photograph…';
+ try{
+  const r=await fetch('/api/capture',{method:'POST'});
+  const d=await r.json();
+  if(!r.ok||!d.success) throw new Error(d.error||'Capture failed');
+  msg.textContent='Saved: '+d.filename;
+  await loadImages();
+ }catch(e){msg.className='message error';msg.textContent='Capture error: '+e.message;}
+ finally{btn.disabled=false;}
 }
 
-
-// =====================================================
-// UPDATE RELAY DISPLAY
-// =====================================================
-
-function updateRelayUI(channel, state) {
-
-    relayStates[channel] = state;
-
-    const status =
-        document.getElementById("status" + channel);
-
-    const button =
-        document.getElementById("relayBtn" + channel);
-
-    if (state === true) {
-
-        status.textContent = "● ON";
-        status.className = "relay-status on";
-
-        button.textContent = "Turn OFF";
-        button.classList.add("enabled");
-
-    } else {
-
-        status.textContent = "● OFF";
-        status.className = "relay-status off";
-
-        button.textContent = "Turn ON";
-        button.classList.remove("enabled");
-
-    }
-
+function updateRelayUI(ch,item){
+ relayStates[ch]=item.on;
+ const s=document.getElementById('status'+ch);
+ const b=document.getElementById('relayBtn'+ch);
+ const t=document.getElementById('timer'+ch);
+ s.textContent=item.on?'● ON':'● OFF';
+ s.className='state '+(item.on?'good':'bad');
+ b.textContent=item.on?'Turn OFF':'Turn ON';
+ b.classList.toggle('on',item.on);
+ t.textContent=item.on
+  ? 'Auto OFF in '+item.remaining_seconds+'s (limit '+item.max_on_seconds+'s)'
+  : 'Auto OFF limit: '+item.max_on_seconds+'s';
 }
 
-
-// =====================================================
-// GET LIVE HARDWARE STATUS
-// =====================================================
-
-async function updateStatus() {
-
-    try {
-
-        const response = await fetch(
-            "/api/status",
-            { cache: "no-store" }
-        );
-
-        if (!response.ok) {
-            throw new Error("Server unavailable");
-        }
-
-        const data = await response.json();
-
-        updateRelayUI(1, data.relay1);
-        updateRelayUI(2, data.relay2);
-
-        const cameraStatus =
-            document.getElementById("cameraStatus");
-
-        cameraStatus.textContent = "ONLINE";
-        cameraStatus.className = "online";
-
-    } catch (error) {
-
-        const cameraStatus =
-            document.getElementById("cameraStatus");
-
-        cameraStatus.textContent = "OFFLINE";
-        cameraStatus.className = "offline";
-
-    }
-
+async function updateStatus(){
+ try{
+  const r=await fetch('/api/status',{cache:'no-store'});
+  if(!r.ok)throw new Error('Status unavailable');
+  const d=await r.json();
+  updateRelayUI(1,d.relay1); updateRelayUI(2,d.relay2);
+  const c=document.getElementById('cameraStatus');
+  c.textContent='ONLINE';c.className='good';
+  document.getElementById('buzzerStatus').textContent=d.buzzer?'READY':'DISABLED';
+ }catch(e){
+  const c=document.getElementById('cameraStatus');
+  c.textContent='OFFLINE';c.className='bad';
+ }
 }
 
-
-// =====================================================
-// RELAY CONTROL
-// =====================================================
-
-async function toggleRelay(channel) {
-
-    if (relayBusy[channel]) {
-        return;
-    }
-
-    relayBusy[channel] = true;
-
-    const button =
-        document.getElementById("relayBtn" + channel);
-
-    button.disabled = true;
-
-    const desiredState =
-        !relayStates[channel];
-
-    try {
-
-        const response = await fetch(
-            "/api/relay/" + channel,
-            {
-                method: "POST",
-
-                headers: {
-                    "Content-Type": "application/json"
-                },
-
-                body: JSON.stringify({
-                    on: desiredState
-                })
-            }
-        );
-
-        const result = await response.json();
-
-        if (!response.ok || !result.success) {
-
-            throw new Error(
-                result.error || "Relay operation failed"
-            );
-
-        }
-
-        updateRelayUI(
-            channel,
-            result.state
-        );
-
-    } catch (error) {
-
-        alert("Relay error: " + error.message);
-
-        updateStatus();
-
-    } finally {
-
-        relayBusy[channel] = false;
-
-        button.disabled = false;
-
-    }
-
+async function toggleRelay(ch){
+ if(relayBusy[ch])return;
+ relayBusy[ch]=true;
+ const b=document.getElementById('relayBtn'+ch);b.disabled=true;
+ try{
+  const r=await fetch('/api/relay/'+ch,{
+   method:'POST',headers:{'Content-Type':'application/json'},
+   body:JSON.stringify({on:!relayStates[ch]})
+  });
+  const d=await r.json();
+  if(!r.ok||!d.success)throw new Error(d.error||'Relay operation failed');
+  updateRelayUI(ch,d.state);
+ }catch(e){alert('Relay error: '+e.message);await updateStatus();}
+ finally{relayBusy[ch]=false;b.disabled=false;}
 }
 
-
-// =====================================================
-// LOAD IMAGE GALLERY
-// =====================================================
-
-async function loadImages() {
-
-    const gallery =
-        document.getElementById("gallery");
-
-    try {
-
-        const response = await fetch(
-            "/api/images",
-            { cache: "no-store" }
-        );
-
-        if (!response.ok) {
-            throw new Error("Gallery unavailable");
-        }
-
-        const images = await response.json();
-
-        gallery.replaceChildren();
-
-        document.getElementById(
-            "photoCount"
-        ).textContent = images.length;
-
-        if (images.length === 0) {
-
-            gallery.textContent =
-                "No photographs captured yet.";
-
-            return;
-
-        }
-
-        images.forEach(function(image) {
-
-            const card =
-                document.createElement("div");
-
-            card.className = "photo";
-
-            const link =
-                document.createElement("a");
-
-            link.href = image.url;
-            link.target = "_blank";
-            link.rel = "noopener";
-
-            const img =
-                document.createElement("img");
-
-            img.src =
-                image.url + "?t=" + Date.now();
-
-            img.alt = image.name;
-            img.loading = "lazy";
-
-            const info =
-                document.createElement("div");
-
-            info.className = "photo-info";
-
-            const name =
-                document.createElement("div");
-
-            name.className = "photo-name";
-            name.textContent = image.name;
-
-            const download =
-                document.createElement("a");
-
-            download.href = image.download_url;
-            download.textContent = "⬇ Download";
-            download.className = "download";
-
-            info.appendChild(name);
-            info.appendChild(download);
-
-            link.appendChild(img);
-
-            card.appendChild(link);
-            card.appendChild(info);
-
-            gallery.appendChild(card);
-
-        });
-
-    } catch (error) {
-
-        gallery.textContent =
-            "Unable to load gallery.";
-
-    }
-
+async function loadImages(){
+ const box=document.getElementById('gallery');
+ try{
+  const r=await fetch('/api/images',{cache:'no-store'});
+  if(!r.ok)throw new Error('Gallery unavailable');
+  const images=await r.json();
+  document.getElementById('photoCount').textContent=images.length;
+  box.replaceChildren();
+  if(!images.length){box.textContent='No photographs captured yet.';return;}
+  for(const item of images){
+   const card=document.createElement('div');card.className='photo';
+   const link=document.createElement('a');link.href=item.url;link.target='_blank';link.rel='noopener';
+   const img=document.createElement('img');img.src=item.url+'?v='+encodeURIComponent(item.modified);
+   img.alt=item.name;img.loading='lazy';link.appendChild(img);
+   const info=document.createElement('div');info.className='photo-info';
+   const name=document.createElement('div');name.textContent=item.name;
+   const dl=document.createElement('a');dl.className='download';dl.href=item.download_url;dl.textContent='⬇ Download';
+   info.append(name,dl);card.append(link,info);box.appendChild(card);
+  }
+ }catch(e){box.textContent='Unable to load gallery: '+e.message;}
 }
 
-
-// =====================================================
-// AUTOMATIC UPDATES
-// =====================================================
-
-updateStatus();
-loadImages();
-
-// Refresh relay states every 2 seconds
-setInterval(updateStatus, 2000);
-
-// Refresh image gallery every 10 seconds
-setInterval(loadImages, 10000);
-
-
+updateStatus();loadImages();
+setInterval(updateStatus,1000);
+setInterval(loadImages,10000);
 </script>
-
 </body>
-
 </html>
 """
 
 
-# =========================================================
-# 8. HOME PAGE
-# =========================================================
+# ============================================================
+# FLASK ROUTES
+# ============================================================
 
 @app.route("/")
 def home():
-
     return render_template_string(HTML_PAGE)
 
 
-# =========================================================
-# 9. LIVE VIDEO ENDPOINT
-# =========================================================
-
 @app.route("/video_feed")
 def video_feed():
-
-    response = Response(
+    return Response(
         generate_video(),
-        mimetype="multipart/x-mixed-replace; boundary=frame"
+        mimetype="multipart/x-mixed-replace; boundary=frame",
+        headers={"Cache-Control": "no-store"}
     )
 
-    response.headers["Cache-Control"] = "no-store"
-
-    return response
-
-
-# =========================================================
-# 10. CAPTURE PHOTO ENDPOINT
-# =========================================================
 
 @app.route("/api/capture", methods=["POST"])
 def api_capture():
+    result = capture_photo("web")
+    return jsonify(result), (200 if result["success"] else 500)
 
-    result = capture_photo(source="web")
-
-    status = 200 if result["success"] else 500
-
-    return jsonify(result), status
-
-
-# =========================================================
-# 11. RELAY STATUS ENDPOINT
-# =========================================================
 
 @app.route("/api/status")
 def api_status():
-
     return jsonify({
+        **get_all_relay_status(),
         "camera": "online",
-        **get_relay_status()
+        "buzzer": buzzer is not None,
     })
 
 
-# =========================================================
-# 12. RELAY CONTROL ENDPOINT
-# =========================================================
-
 @app.route("/api/relay/<int:channel>", methods=["POST"])
 def api_relay(channel):
-
     if channel not in (1, 2):
+        return jsonify({"success": False, "error": "Invalid relay channel"}), 400
 
-        return jsonify({
-            "success": False,
-            "error": "Invalid relay channel"
-        }), 400
-
-    data = request.get_json(silent=True) or {}
-
+    data = __import__("flask").request.get_json(silent=True) or {}
     state = data.get("on")
-
     if not isinstance(state, bool):
-
-        return jsonify({
-            "success": False,
-            "error": "Expected boolean ON/OFF value"
-        }), 400
+        return jsonify({"success": False, "error": "Expected JSON boolean field 'on'"}), 400
 
     try:
+        status = set_relay(channel, state, reason="web")
+        return jsonify({"success": True, "channel": channel, "state": status})
+    except Exception as exc:
+        log.exception("Relay command failed")
+        return jsonify({"success": False, "error": str(exc)}), 500
 
-        actual_state = set_relay(channel, state)
-
-        return jsonify({
-            "success": True,
-            "channel": channel,
-            "state": actual_state
-        })
-
-    except Exception as error:
-
-        logger.exception("Relay control error")
-
-        return jsonify({
-            "success": False,
-            "error": str(error)
-        }), 500
-
-
-# =========================================================
-# 13. GET IMAGE GALLERY
-# =========================================================
 
 @app.route("/api/images")
 def api_images():
-
-    files = sorted(
+    images = []
+    for path in sorted(
         PHOTO_DIR.glob("IMG_*.jpg"),
-        key=lambda file: file.stat().st_mtime,
+        key=lambda p: p.stat().st_mtime,
         reverse=True
+    ):
+        stat = path.stat()
+        images.append({
+            "name": path.name,
+            "url": f"/images/{path.name}",
+            "download_url": f"/download/{path.name}",
+            "modified": int(stat.st_mtime),
+            "size": stat.st_size,
+        })
+    return jsonify(images)
+
+
+def valid_photo_name(filename):
+    return (
+        Path(filename).name == filename
+        and filename.startswith("IMG_")
+        and filename.lower().endswith(".jpg")
     )
 
-    result = []
-
-    for file in files:
-
-        result.append({
-
-            "name": file.name,
-
-            "url": f"/images/{file.name}",
-
-            "download_url": f"/download/{file.name}"
-
-        })
-
-    return jsonify(result)
-
-
-# =========================================================
-# 14. OPEN IMAGE
-# =========================================================
 
 @app.route("/images/<path:filename>")
 def serve_image(filename):
-
-    if (
-        Path(filename).name != filename
-        or not filename.startswith("IMG_")
-        or not filename.lower().endswith(".jpg")
-    ):
+    if not valid_photo_name(filename):
         abort(404)
-
-    filepath = PHOTO_DIR / filename
-
-    if not filepath.is_file():
+    path = PHOTO_DIR / filename
+    if not path.is_file():
         abort(404)
+    return send_from_directory(PHOTO_DIR, filename, mimetype="image/jpeg")
 
-    response = send_from_directory(
-        PHOTO_DIR,
-        filename,
-        mimetype="image/jpeg"
-    )
-
-    response.headers["Cache-Control"] = "no-store"
-
-    return response
-
-
-# =========================================================
-# 15. DOWNLOAD IMAGE
-# =========================================================
 
 @app.route("/download/<path:filename>")
 def download_image(filename):
-
-    if (
-        Path(filename).name != filename
-        or not filename.startswith("IMG_")
-        or not filename.lower().endswith(".jpg")
-    ):
+    if not valid_photo_name(filename):
         abort(404)
-
-    filepath = PHOTO_DIR / filename
-
-    if not filepath.is_file():
+    path = PHOTO_DIR / filename
+    if not path.is_file():
         abort(404)
-
     return send_from_directory(
-        PHOTO_DIR,
-        filename,
-        as_attachment=True,
-        mimetype="image/jpeg"
+        PHOTO_DIR, filename, as_attachment=True, mimetype="image/jpeg"
     )
 
 
-# =========================================================
-# 16. APPLICATION SHUTDOWN
-# =========================================================
+# ============================================================
+# CLEAN SHUTDOWN
+# ============================================================
+
+_cleanup_lock = threading.Lock()
+_cleaned = False
+
 
 def cleanup():
-
-    global is_shutting_down
-
-    with shutdown_lock:
-
-        if is_shutting_down:
+    global _cleaned
+    with _cleanup_lock:
+        if _cleaned:
             return
+        _cleaned = True
 
-        is_shutting_down = True
+    log.info("Shutting down camera and GPIO")
+    shutdown_event.set()
 
-    logger.info("Starting hardware shutdown...")
+    # Set relay outputs OFF before releasing GPIO.
+    for channel in (1, 2):
+        try:
+            relays[channel].off()
+        except Exception:
+            log.exception("Could not switch relay %d OFF", channel)
 
     try:
         capture_button.close()
     except Exception:
-        logger.exception("Button cleanup failed")
+        pass
 
-    # Turn both relays OFF
-    for relay in relays:
-
-        try:
-            relay.off()
-        except Exception:
-            logger.exception("Relay OFF failed")
-
-    for relay in relays:
-
+    for relay in relays.values():
         try:
             relay.close()
         except Exception:
-            logger.exception("Relay cleanup failed")
+            pass
+
+    if buzzer is not None:
+        try:
+            buzzer.off()
+            buzzer.close()
+        except Exception:
+            pass
 
     try:
         with camera_lock:
             camera.stop()
             camera.close()
     except Exception:
-        logger.exception("Camera cleanup failed")
+        log.exception("Camera cleanup failed")
 
-    logger.info("Hardware shutdown completed.")
+    log.info("Shutdown complete")
 
 
-def handle_exit(signum, frame):
-
+def handle_signal(signum, frame):
     cleanup()
-
     raise SystemExit(0)
 
 
 atexit.register(cleanup)
+signal.signal(signal.SIGTERM, handle_signal)
+signal.signal(signal.SIGINT, handle_signal)
 
-signal.signal(signal.SIGTERM, handle_exit)
-signal.signal(signal.SIGINT, handle_exit)
 
-
-# =========================================================
-# 17. START APPLICATION
-# =========================================================
+# ============================================================
+# MAIN
+# ============================================================
 
 if __name__ == "__main__":
+    log.info("==========================================")
+    log.info(" RASPBERRY PI CAMERA + RELAY + BUZZER")
+    log.info("==========================================")
+    log.info("Dashboard: http://0.0.0.0:%d", PORT)
+    log.info("Photos: %s", PHOTO_DIR)
+    log.info("Button: BCM GPIO%d", BUTTON_PIN)
+    log.info("Relay 1: BCM GPIO%d, max ON %ds",
+             RELAY_1_PIN, relay_limits[1])
+    log.info("Relay 2: BCM GPIO%d, max ON %ds",
+             RELAY_2_PIN, relay_limits[2])
+    log.info("Buzzer: %s on BCM GPIO%d",
+             "enabled" if buzzer is not None else "disabled", BUZZER_PIN)
 
-    logger.info("======================================")
-    logger.info(" RASPBERRY PI CAMERA CONTROL SYSTEM")
-    logger.info("======================================")
+    play_sound("startup")
 
-    logger.info("Web server: http://0.0.0.0:%s", PORT)
-
-    logger.info("Photo directory: %s", PHOTO_DIR)
-
-    logger.info("Camera button: GPIO %s", BUTTON_PIN)
-
-    logger.info("Relay 1: GPIO %s", RELAY_1_PIN)
-
-    logger.info("Relay 2: GPIO %s", RELAY_2_PIN)
-
-    logger.info("Camera resolution: %s", PHOTO_SIZE)
-
-    logger.info("Video resolution: %s", VIDEO_SIZE)
-
+    # Use one Flask process only; GPIO/camera must not be initialized twice.
     app.run(
         host=HOST,
         port=PORT,
